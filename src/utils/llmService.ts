@@ -11,29 +11,17 @@ import type {
 class LLMService {
   private readonly API_ENDPOINT = 'https://hexavarsity-secureapi.azurewebsites.net/api/azureai';
   private readonly MODEL = 'gpt-4';
-  private readonly API_KEY = import.meta.env.VITE_OPENAI_API_KEY;
 
   async generateQuestions(request: QuestionGenerationRequest): Promise<LLMQuestion[]> {
     try {
-      console.log('Attempting to generate questions with OpenAI...', request);
+      console.log('Attempting to generate questions with Azure OpenAI...', request);
       
-      // Always use fallback questions for now since API might not be properly configured
-      console.log('Using fallback questions due to API configuration');
-      return this.generateFallbackQuestions(request);
-      
-      // Commented out API call for now
-      /*
-      if (!this.API_KEY) {
-        console.warn('API key not found. Using fallback questions.');
-        return this.generateFallbackQuestions(request);
-      }
-
       const prompt = this.createPrompt(request);
+      
       const response = await fetch(this.API_ENDPOINT, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.API_KEY}`,
         },
         body: JSON.stringify({
           model: this.MODEL,
@@ -52,18 +40,28 @@ class LLMService {
         })
       });
 
+      console.log('API Response status:', response.status);
+
       if (!response.ok) {
-        throw new Error(`OpenAI API error: ${response.status}`);
+        const errorText = await response.text();
+        console.error('API Error Response:', errorText);
+        throw new Error(`Azure OpenAI API error: ${response.status} - ${errorText}`);
       }
 
       const data = await response.json();
+      console.log('API Response data:', data);
+      
       const content = data.choices?.[0]?.message?.content?.trim();
-      if (!content) throw new Error('No content from OpenAI');
+      if (!content) {
+        throw new Error('No content from Azure OpenAI');
+      }
 
       return this.parseOpenAIResponse(content, request);
-      */
     } catch (error) {
       console.error('LLM Error:', error);
+      
+      // Only use fallback if API is completely unavailable
+      console.warn('API failed, using fallback questions as last resort');
       return this.generateFallbackQuestions(request);
     }
   }
@@ -78,45 +76,73 @@ Generate ${request.questionCount} multiple-choice questions for a ${request.diff
 ${context}
 
 Requirements:
-- 4 options per question
-- Real-world scenario based
-- Include explanations
-- Respond with valid JSON array in this format:
+- 4 options per question (A, B, C, D)
+- Real-world scenario based questions
+- Include detailed explanations for correct answers
+- Questions should be relevant to ${request.userRole || 'professionals'} in ${request.userDepartment || 'technology'}
+- Difficulty level: ${request.difficulty}
+- Respond with valid JSON array in this exact format:
 
 [
   {
-    "question": "Your question?",
-    "options": ["A", "B", "C", "D"],
+    "question": "Your question text here?",
+    "options": ["Option A", "Option B", "Option C", "Option D"],
     "correctAnswer": 0,
-    "explanation": "Why the answer is correct",
+    "explanation": "Detailed explanation of why this answer is correct",
     "difficulty": "${this.mapDifficultyLevel(request.difficulty)}",
     "category": "${request.category}",
     "topic": "${request.topic}"
   }
 ]
+
+Make sure the response is valid JSON and contains exactly ${request.questionCount} questions.
     `;
   }
 
   private parseOpenAIResponse(content: string, request: QuestionGenerationRequest): LLMQuestion[] {
     try {
-      const cleaned = content.replace(/```json|```/g, '').trim();
+      console.log('Parsing OpenAI response:', content);
+      
+      // Clean the response - remove markdown code blocks if present
+      let cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+      
+      // Try to find JSON array in the response
+      const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        cleaned = jsonMatch[0];
+      }
+      
       const parsed = JSON.parse(cleaned);
 
-      if (!Array.isArray(parsed)) throw new Error('Invalid format');
+      if (!Array.isArray(parsed)) {
+        throw new Error('Response is not an array');
+      }
 
-      return parsed.map((q, i) => ({
-        id: i + 1,
-        question: q.question,
-        options: q.options,
-        correctAnswer: q.correctAnswer,
-        explanation: q.explanation,
-        difficulty: q.difficulty ?? this.mapDifficultyLevel(request.difficulty),
-        category: q.category ?? request.category,
-        topic: q.topic ?? request.topic
-      }));
+      if (parsed.length === 0) {
+        throw new Error('No questions in response');
+      }
+
+      return parsed.map((q, i) => {
+        // Validate question structure
+        if (!q.question || !Array.isArray(q.options) || q.options.length !== 4 || typeof q.correctAnswer !== 'number') {
+          throw new Error(`Invalid question structure at index ${i}`);
+        }
+
+        return {
+          id: i + 1,
+          question: q.question,
+          options: q.options,
+          correctAnswer: q.correctAnswer,
+          explanation: q.explanation || 'No explanation provided',
+          difficulty: q.difficulty ?? this.mapDifficultyLevel(request.difficulty),
+          category: q.category ?? request.category,
+          topic: q.topic ?? request.topic
+        };
+      });
     } catch (err) {
-      console.error('Failed to parse response:', err);
-      throw new Error('Invalid response format from OpenAI');
+      console.error('Failed to parse OpenAI response:', err);
+      console.error('Raw content:', content);
+      throw new Error(`Invalid response format from Azure OpenAI: ${err.message}`);
     }
   }
 
