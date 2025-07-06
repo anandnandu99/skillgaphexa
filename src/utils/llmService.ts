@@ -11,11 +11,32 @@ import type {
 class LLMService {
   private readonly API_ENDPOINT = 'https://hexavarsity-secureapi.azurewebsites.net/api/azureai';
   private readonly MODEL = 'gpt-4';
+  private readonly TIMEOUT = 10000; // 10 seconds timeout
 
   async generateQuestions(request: QuestionGenerationRequest): Promise<LLMQuestion[]> {
+    console.log('Starting question generation...', request);
+    
     try {
-      console.log('Attempting to generate questions with Azure OpenAI...', request);
-      
+      // Try external API with timeout
+      const questions = await this.tryExternalAPI(request);
+      if (questions && questions.length > 0) {
+        console.log('Successfully generated questions from external API');
+        return questions;
+      }
+    } catch (error) {
+      console.warn('External API failed:', error);
+    }
+
+    // Always fall back to local questions
+    console.log('Using fallback questions');
+    return this.generateFallbackQuestions(request);
+  }
+
+  private async tryExternalAPI(request: QuestionGenerationRequest): Promise<LLMQuestion[]> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.TIMEOUT);
+
+    try {
       const prompt = this.createPrompt(request);
       
       const response = await fetch(this.API_ENDPOINT, {
@@ -37,32 +58,27 @@ class LLMService {
           ],
           temperature: 0.8,
           max_tokens: 2000
-        })
+        }),
+        signal: controller.signal
       });
 
-      console.log('API Response status:', response.status);
+      clearTimeout(timeoutId);
 
       if (!response.ok) {
-        const errorText = await response.text();
-        console.error('API Error Response:', errorText);
-        throw new Error(`Azure OpenAI API error: ${response.status} - ${errorText}`);
+        throw new Error(`API error: ${response.status}`);
       }
 
       const data = await response.json();
-      console.log('API Response data:', data);
-      
       const content = data.choices?.[0]?.message?.content?.trim();
+      
       if (!content) {
-        throw new Error('No content from Azure OpenAI');
+        throw new Error('No content from API');
       }
 
       return this.parseOpenAIResponse(content, request);
     } catch (error) {
-      console.error('LLM Error:', error);
-      
-      // Only use fallback if API is completely unavailable
-      console.warn('API failed, using fallback questions as last resort');
-      return this.generateFallbackQuestions(request);
+      clearTimeout(timeoutId);
+      throw error;
     }
   }
 
@@ -101,12 +117,8 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
 
   private parseOpenAIResponse(content: string, request: QuestionGenerationRequest): LLMQuestion[] {
     try {
-      console.log('Parsing OpenAI response:', content);
-      
-      // Clean the response - remove markdown code blocks if present
       let cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
       
-      // Try to find JSON array in the response
       const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
       if (jsonMatch) {
         cleaned = jsonMatch[0];
@@ -114,16 +126,11 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
       
       const parsed = JSON.parse(cleaned);
 
-      if (!Array.isArray(parsed)) {
-        throw new Error('Response is not an array');
-      }
-
-      if (parsed.length === 0) {
-        throw new Error('No questions in response');
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        throw new Error('Invalid response format');
       }
 
       return parsed.map((q, i) => {
-        // Validate question structure
         if (!q.question || !Array.isArray(q.options) || q.options.length !== 4 || typeof q.correctAnswer !== 'number') {
           throw new Error(`Invalid question structure at index ${i}`);
         }
@@ -140,9 +147,7 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
         };
       });
     } catch (err) {
-      console.error('Failed to parse OpenAI response:', err);
-      console.error('Raw content:', content);
-      throw new Error(`Invalid response format from Azure OpenAI: ${err.message}`);
+      throw new Error(`Failed to parse API response: ${err.message}`);
     }
   }
 
@@ -152,21 +157,24 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
     const bank = this.getFallbackQuestionBank();
     const topicKey = this.findBestMatchingTopic(request.topic, bank);
     const topic = bank[topicKey];
-    const questions = topic[request.difficulty] ?? topic.beginner;
-
-    if (questions.length === 0) {
-      // If no questions for this difficulty, try other difficulties
+    
+    // Get questions for the requested difficulty, or mix from all difficulties
+    let availableQuestions = topic[request.difficulty] || [];
+    
+    if (availableQuestions.length < request.questionCount) {
+      // Add questions from other difficulties if needed
       const allQuestions = [...topic.beginner, ...topic.intermediate, ...topic.advanced];
-      if (allQuestions.length === 0) {
-        // Use default questions if nothing found
-        return this.getDefaultQuestions(request);
-      }
-      questions.push(...allQuestions);
+      availableQuestions = [...new Set([...availableQuestions, ...allQuestions])];
     }
 
-    const selected = [...questions]
+    if (availableQuestions.length === 0) {
+      // Use default questions if nothing found
+      availableQuestions = this.getDefaultQuestions(request);
+    }
+
+    const selected = [...availableQuestions]
       .sort(() => Math.random() - 0.5)
-      .slice(0, Math.min(request.questionCount, questions.length));
+      .slice(0, Math.min(request.questionCount, availableQuestions.length));
 
     return selected.map((q, i) => ({
       id: i + 1,
@@ -194,8 +202,8 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
     return match || keys[0]; // Return first available if no match
   }
 
-  private getDefaultQuestions(request: QuestionGenerationRequest): LLMQuestion[] {
-    const defaultQuestions = [
+  private getDefaultQuestions(request: QuestionGenerationRequest): FallbackQuestion[] {
+    return [
       {
         question: `What is a key principle in ${request.category}?`,
         options: ['Best practices', 'Random approach', 'Ignoring standards', 'Avoiding documentation'],
@@ -213,19 +221,20 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
         options: ['Deep understanding', 'Surface knowledge', 'No experience', 'Theoretical only'],
         correctAnswer: 0,
         explanation: `${request.difficulty} level requires comprehensive understanding.`
+      },
+      {
+        question: `In ${request.category}, what is most important for success?`,
+        options: ['Practical application', 'Memorizing theory', 'Avoiding practice', 'Working alone'],
+        correctAnswer: 0,
+        explanation: 'Practical application of knowledge is crucial for success in any field.'
+      },
+      {
+        question: `What approach works best for ${request.difficulty} level learning?`,
+        options: ['Structured progression', 'Random topics', 'Skipping basics', 'Avoiding challenges'],
+        correctAnswer: 0,
+        explanation: 'Structured progression ensures solid foundation and gradual skill building.'
       }
     ];
-
-    return defaultQuestions.map((q, i) => ({
-      id: i + 1,
-      question: q.question,
-      options: q.options,
-      correctAnswer: q.correctAnswer,
-      explanation: q.explanation,
-      difficulty: this.mapDifficultyLevel(request.difficulty),
-      category: request.category,
-      topic: request.topic
-    }));
   }
 
   private personalizeQuestion(question: string, request: QuestionGenerationRequest): string {
@@ -322,6 +331,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['Calls a function immediately', 'Creates a new function with a specific `this` value', 'Binds two variables', 'Connects to a database'],
             correctAnswer: 1,
             explanation: 'The bind() method creates a new function with a specified `this` value and initial arguments.'
+          },
+          {
+            question: 'What is the difference between `==` and `===` in JavaScript?',
+            options: ['No difference', '== checks type, === checks value', '== allows type coercion, === does not', '=== is faster'],
+            correctAnswer: 2,
+            explanation: '== performs type coercion before comparison, while === compares both value and type without coercion.'
           }
         ],
         advanced: [
@@ -330,6 +345,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['Handle DOM events only', 'Manage asynchronous operations', 'Create loops', 'Handle errors'],
             correctAnswer: 1,
             explanation: 'The Event Loop manages the execution of asynchronous operations, allowing JavaScript to be non-blocking despite being single-threaded.'
+          },
+          {
+            question: 'What is a WeakMap in JavaScript?',
+            options: ['A map with weak references to keys', 'A map with limited size', 'A slow map implementation', 'A map for weak values'],
+            correctAnswer: 0,
+            explanation: 'WeakMap holds weak references to its keys, allowing them to be garbage collected when no other references exist.'
           }
         ]
       },
@@ -346,6 +367,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['ReactDOM.render()', 'React.render()', 'Component.render()', 'DOM.render()'],
             correctAnswer: 0,
             explanation: 'ReactDOM.render() is used to render React components into the DOM.'
+          },
+          {
+            question: 'What is a React component?',
+            options: ['A JavaScript function or class', 'An HTML element', 'A CSS style', 'A database table'],
+            correctAnswer: 0,
+            explanation: 'A React component is a JavaScript function or class that returns JSX to describe what should appear on the screen.'
           }
         ],
         intermediate: [
@@ -354,6 +381,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['Manage state', 'Handle side effects', 'Create components', 'Style components'],
             correctAnswer: 1,
             explanation: 'useEffect is used to handle side effects like API calls, subscriptions, and DOM manipulation.'
+          },
+          {
+            question: 'What is the difference between state and props?',
+            options: ['No difference', 'State is mutable, props are immutable', 'Props are mutable, state is immutable', 'Both are the same'],
+            correctAnswer: 1,
+            explanation: 'State is mutable and managed within a component, while props are immutable and passed from parent components.'
           }
         ],
         advanced: [
@@ -362,6 +395,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['A new component type', 'A reconciliation algorithm', 'A styling library', 'A testing framework'],
             correctAnswer: 1,
             explanation: 'React Fiber is a complete rewrite of React\'s reconciliation algorithm that enables features like time-slicing and suspense.'
+          },
+          {
+            question: 'What is the purpose of React.memo()?',
+            options: ['Memoize expensive calculations', 'Prevent unnecessary re-renders', 'Store component state', 'Handle errors'],
+            correctAnswer: 1,
+            explanation: 'React.memo() is a higher-order component that prevents unnecessary re-renders by memoizing the component.'
           }
         ]
       },
@@ -372,6 +411,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['To delete all data', 'To remove errors and inconsistencies', 'To encrypt data', 'To compress data'],
             correctAnswer: 1,
             explanation: 'Data cleaning involves identifying and correcting errors, inconsistencies, and inaccuracies in datasets.'
+          },
+          {
+            question: 'What is a dataset?',
+            options: ['A collection of data', 'A type of database', 'A programming language', 'A visualization tool'],
+            correctAnswer: 0,
+            explanation: 'A dataset is a collection of data, typically organized in rows and columns for analysis.'
           }
         ],
         intermediate: [
@@ -380,6 +425,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['Model performs well on training but poorly on test data', 'Model performs poorly on all data', 'Model is too simple', 'Model has too few parameters'],
             correctAnswer: 0,
             explanation: 'Overfitting occurs when a model learns the training data too well, including noise, leading to poor generalization.'
+          },
+          {
+            question: 'What is cross-validation?',
+            options: ['Validating data twice', 'A technique to assess model performance', 'Checking data types', 'Comparing two models'],
+            correctAnswer: 1,
+            explanation: 'Cross-validation is a technique used to assess how well a model will generalize to an independent dataset.'
           }
         ],
         advanced: [
@@ -398,6 +449,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['Elastic Compute Cloud', 'Enhanced Cloud Computing', 'Elastic Container Cloud', 'Extended Compute Capacity'],
             correctAnswer: 0,
             explanation: 'EC2 stands for Elastic Compute Cloud, which provides scalable computing capacity in the AWS cloud.'
+          },
+          {
+            question: 'What is AWS S3 used for?',
+            options: ['Computing power', 'Object storage', 'Database management', 'Network routing'],
+            correctAnswer: 1,
+            explanation: 'Amazon S3 (Simple Storage Service) is used for object storage, allowing you to store and retrieve any amount of data.'
           }
         ],
         intermediate: [
@@ -424,6 +481,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['Give users maximum access', 'Give users minimum necessary access', 'Remove all access', 'Give random access'],
             correctAnswer: 1,
             explanation: 'The principle of least privilege means giving users only the minimum access necessary to perform their job functions.'
+          },
+          {
+            question: 'What is a firewall?',
+            options: ['A physical wall', 'A network security device', 'A type of malware', 'A backup system'],
+            correctAnswer: 1,
+            explanation: 'A firewall is a network security device that monitors and controls incoming and outgoing network traffic.'
           }
         ],
         intermediate: [
@@ -450,6 +513,12 @@ Make sure the response is valid JSON and contains exactly ${request.questionCoun
             options: ['User Experience', 'User Extension', 'Universal Experience', 'Unified Extension'],
             correctAnswer: 0,
             explanation: 'UX stands for User Experience, which encompasses all aspects of a user\'s interaction with a product or service.'
+          },
+          {
+            question: 'What is the difference between UI and UX?',
+            options: ['No difference', 'UI is visual design, UX is user experience', 'UX is visual design, UI is user experience', 'They are the same thing'],
+            correctAnswer: 1,
+            explanation: 'UI (User Interface) focuses on visual design and layout, while UX (User Experience) focuses on the overall user journey and satisfaction.'
           }
         ],
         intermediate: [
